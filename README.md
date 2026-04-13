@@ -17,8 +17,8 @@ Le pipeline détecte ces problèmes, les corrige, et aligne toutes les vidéos s
 ## TL;DR
 
 ```bash
-git clone <url-du-repo> Codes_ZED
-cd Codes_ZED
+git clone https://github.com/flodelaplace/zed-multicam-sync.git
+cd zed-multicam-sync
 
 conda env create -f environment.yml
 conda activate zed_env
@@ -46,8 +46,8 @@ Le pipeline produit un dossier `MP4_synced/` avec toutes les vidéos alignées.
 ### 1. Cloner le repo
 
 ```bash
-git clone <url-du-repo> Codes_ZED
-cd Codes_ZED
+git clone https://github.com/flodelaplace/zed-multicam-sync.git
+cd zed-multicam-sync
 ```
 
 ### 2. Créer l'environnement
