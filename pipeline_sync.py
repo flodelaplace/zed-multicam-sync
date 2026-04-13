@@ -273,11 +273,80 @@ def step_detect_fps(csv_path):
 
 
 # =============================================================================
-# ÉTAPE 4 : réparation (insertion de frames noires), parallélisée
+# ÉTAPE 4 : réparation (insertion de frames noires + rotation), parallélisée
 # =============================================================================
-def _repair_mp4_worker(mp4_path, timestamps, fps_target, output_path):
-    """Worker : lit le MP4 brut, écrit un MP4 "réparé" en insérant des frames
-    noires là où les timestamps indiquent des drops."""
+def parse_rotations(spec):
+    """Parse une spec `--rotate` en dict {pattern: angle}.
+
+    Formats acceptés :
+      - "180"                    -> {"all": 180}  (toutes caméras)
+      - "22516499=180"           -> {"22516499": 180}
+      - "cam1=90,cam2=180"       -> {"cam1": 90, "cam2": 180}
+      - "all=180,cam3=0"         -> toutes à 180° sauf cam3 à 0°
+    """
+    if not spec:
+        return {}
+
+    result = {}
+    # Cas court : un seul angle sans '=' -> applique à tout
+    if "=" not in spec:
+        try:
+            return {"all": int(spec.strip())}
+        except ValueError:
+            log.warning("Rotation ignorée (entier attendu) : %s", spec)
+            return {}
+
+    for pair in spec.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "=" not in pair:
+            log.warning("Rotation ignorée (pas de '=') : %s", pair)
+            continue
+        key, val = pair.split("=", 1)
+        try:
+            angle = int(val.strip())
+        except ValueError:
+            log.warning("Angle invalide pour %s : %s", key, val)
+            continue
+        if angle not in (0, 90, 180, 270):
+            log.warning("Angle non supporté pour %s : %d (attendu 0/90/180/270)", key, angle)
+            continue
+        result[key.strip()] = angle
+    return result
+
+
+def get_rotation_for_file(filename, rotation_map):
+    """Priorité : nom exact > stem exact > substring > 'all' / '*'."""
+    if not rotation_map:
+        return 0
+    base = os.path.basename(filename)
+    stem = os.path.splitext(base)[0]
+    if base in rotation_map:
+        return rotation_map[base]
+    if stem in rotation_map:
+        return rotation_map[stem]
+    for pattern, angle in rotation_map.items():
+        if pattern in ("all", "*"):
+            continue
+        if pattern in base:
+            return angle
+    return rotation_map.get("all", rotation_map.get("*", 0))
+
+
+def _apply_rotation(frame, angle):
+    if angle == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if angle == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if angle == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
+
+
+def _repair_mp4_worker(mp4_path, timestamps, fps_target, output_path, rotate_angle=0):
+    """Worker : lit le MP4 brut, applique la rotation éventuelle, écrit un MP4
+    "réparé" en insérant des frames noires là où les timestamps indiquent des drops."""
     cam_name = os.path.basename(mp4_path)
     delta_target = 1000.0 / fps_target
 
@@ -288,13 +357,19 @@ def _repair_mp4_worker(mp4_path, timestamps, fps_target, output_path):
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+    # Rotation 90/270 swap les dimensions de sortie
+    if rotate_angle in (90, 270):
+        out_w, out_h = h, w
+    else:
+        out_w, out_h = w, h
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_path, fourcc, fps_target, (w, h))
+    out = cv2.VideoWriter(output_path, fourcc, fps_target, (out_w, out_h))
     if not out.isOpened():
         cap.release()
         return (cam_name, 0, f"VideoWriter ne s'ouvre pas : {output_path}")
 
-    black = np.zeros((h, w, 3), dtype=np.uint8)
+    black = np.zeros((out_h, out_w, 3), dtype=np.uint8)
     frames_added = 0
     idx = 0
 
@@ -303,6 +378,8 @@ def _repair_mp4_worker(mp4_path, timestamps, fps_target, output_path):
             ret, frame = cap.read()
             if not ret:
                 break
+            if rotate_angle:
+                frame = _apply_rotation(frame, rotate_angle)
             out.write(frame)
 
             if idx < len(timestamps) - 1:
@@ -320,10 +397,12 @@ def _repair_mp4_worker(mp4_path, timestamps, fps_target, output_path):
     return (cam_name, frames_added, None)
 
 
-def step_repair_parallel(csv_path, mp4_input_dir, mp4_output_dir, fps_target, n_workers=None):
+def step_repair_parallel(csv_path, mp4_input_dir, mp4_output_dir, fps_target,
+                         n_workers=None, rotation_map=None):
     """Lance la réparation en parallèle sur tous les MP4 bruts."""
     os.makedirs(mp4_output_dir, exist_ok=True)
     df = pd.read_csv(csv_path, index_col=0)
+    rotation_map = rotation_map or {}
 
     tasks = []
     for col in df.columns:
@@ -334,7 +413,10 @@ def step_repair_parallel(csv_path, mp4_input_dir, mp4_output_dir, fps_target, n_
             log.warning("MP4 introuvable, ignoré : %s", mp4_in)
             continue
         timestamps = df[col].dropna().values.tolist()
-        tasks.append((mp4_in, timestamps, fps_target, mp4_out))
+        rot = get_rotation_for_file(mp4_in, rotation_map)
+        if rot:
+            log.info("[%s] rotation %d° appliquée", base, rot)
+        tasks.append((mp4_in, timestamps, fps_target, mp4_out, rot))
 
     if not tasks:
         log.warning("Aucun MP4 à réparer")
@@ -378,8 +460,18 @@ def main():
                         help="Forcer un FPS cible (sinon détection auto)")
     parser.add_argument("--workers", type=int, default=None,
                         help="Nombre de workers parallèles (défaut = min(n_svo, n_cpu))")
+    parser.add_argument("--rotate", default=None,
+                        help="Rotation par caméra. Formats : "
+                             "'180' (toutes), "
+                             "'22516499=180' (une seule, match par substring), "
+                             "'cam1=90,cam2=180' (plusieurs). "
+                             "Angles supportés : 0, 90, 180, 270.")
     parser.add_argument("--overwrite", action="store_true",
                         help="Force la ré-exécution de chaque étape")
+    parser.add_argument("--rerun-repair", action="store_true",
+                        help="Refait uniquement les étapes 4 (réparation) et 6 "
+                             "(découpage) sans re-lire les SVO. Pratique pour "
+                             "tester de nouvelles rotations.")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--log-file", default=None,
                         help="Fichier log (défaut = <output-dir>/pipeline.log)")
@@ -396,6 +488,10 @@ def main():
     FICHIER_GRAPHIQUE = os.path.join(OUTPUT_DIR, "Graphiques_Analyse.png")
     DOSSIER_SORTIE_MP4 = os.path.join(OUTPUT_DIR, "MP4_repares")
     OUT_SYNC_DIR = os.path.join(OUTPUT_DIR, "MP4_synced")
+
+    rotation_map = parse_rotations(args.rotate)
+    if rotation_map:
+        log.info("Rotations configurées : %s", rotation_map)
 
     log.info("=" * 60)
     log.info("DÉMARRAGE pipeline — input=%s output=%s", INPUT_DIR, OUTPUT_DIR)
@@ -442,6 +538,7 @@ def main():
     # -------------------------------------------------------------------------
     repair_needed = (
         args.overwrite
+        or args.rerun_repair
         or not os.path.isdir(DOSSIER_SORTIE_MP4)
         or not glob.glob(os.path.join(DOSSIER_SORTIE_MP4, "*.mp4"))
     )
@@ -450,7 +547,7 @@ def main():
     else:
         step_repair_parallel(
             FICHIER_CSV, OUTPUT_DIR, DOSSIER_SORTIE_MP4, fps_detecte,
-            n_workers=args.workers,
+            n_workers=args.workers, rotation_map=rotation_map,
         )
 
     # -------------------------------------------------------------------------
@@ -480,6 +577,7 @@ def main():
     # -------------------------------------------------------------------------
     sync_needed = (
         args.overwrite
+        or args.rerun_repair
         or not os.path.isdir(OUT_SYNC_DIR)
         or not glob.glob(os.path.join(OUT_SYNC_DIR, "*_synced.mp4"))
     )

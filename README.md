@@ -121,7 +121,9 @@ python pipeline_sync.py -i "chemin/vers/mon_enregistrement"
 | `--start-frame N` | traite uniquement à partir de la frame N |
 | `--end-frame N` | s'arrête à la frame N (inclus) |
 | `--workers N` | nombre de processus parallèles (défaut : min(n_caméras, n_cpu)) |
+| `--rotate SPEC` | rotation par caméra (voir section ci-dessous) |
 | `--overwrite` | force la ré-exécution de toutes les étapes |
+| `--rerun-repair` | refait seulement les étapes 4 + 6 (ré-utilisation avec nouvelle rotation) |
 | `--log-file PATH` | fichier log (défaut : `<output>/pipeline.log`) |
 | `--debug` | logs DEBUG |
 
@@ -130,6 +132,30 @@ python pipeline_sync.py -i "chemin/vers/mon_enregistrement"
 Chaque étape vérifie si sa sortie existe déjà et la saute. Relance la même
 commande pour reprendre où tu t'étais arrêté.e. Utilise `--overwrite` si tu
 veux tout recalculer.
+
+### Rotation de caméras à l'envers (`--rotate`)
+
+Certaines caméras peuvent être montées tête-en-bas ou en portrait. Le flag
+`--rotate` applique une rotation **pendant l'étape de réparation** (rapide),
+ce qui veut dire que tu peux itérer sans re-lire les SVO.
+
+| Format | Effet |
+|---|---|
+| `--rotate 180` | toutes les caméras à 180° |
+| `--rotate "22516499=180"` | seule la caméra dont le nom contient `22516499` |
+| `--rotate "22516499=180,23859316=90"` | une rotation par caméra |
+| `--rotate "all=180,24710321=0"` | toutes à 180° **sauf** celle qui matche `24710321` |
+
+Angles supportés : `0`, `90`, `180`, `270` (degrés dans le sens horaire).
+
+**Workflow typique** :
+1. Lance le pipeline une première fois sans `--rotate`.
+2. Ouvre les vidéos dans `MP4_repares/` pour repérer celles à l'envers.
+3. Relance avec `--rotate "xxx=180,..." --rerun-repair` — seules les étapes 4
+   et 6 sont refaites, l'extraction SVO (qui est la plus lente) est sautée.
+
+Le flag `--rerun-repair` force uniquement les étapes 4 (réparation) et 6
+(découpage). Le flag `--overwrite` refait tout (y compris l'extraction SVO).
 
 ---
 
