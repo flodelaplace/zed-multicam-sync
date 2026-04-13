@@ -1,0 +1,8 @@
+# Dépendances Python (pip)
+# Le binding ZED (`pyzed`) n'est PAS fourni ici : il s'installe depuis le SDK
+# Stereolabs. Voir README.md > Installation.
+
+numpy>=1.24
+pandas>=1.5
+matplotlib>=3.6
+opencv-python>=4.6

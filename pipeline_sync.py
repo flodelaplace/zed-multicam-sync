@@ -1,0 +1,503 @@
+"""pipeline_sync.py
+
+Orchestrateur du pipeline de synchronisation multi-caméras ZED.
+
+Refonte :
+- Fusion des anciennes étapes 1 (extraction timestamps) et 3 (conversion SVO->MP4)
+  en une seule passe par SVO : chaque fichier .svo n'est ouvert qu'une fois.
+- Parallélisation par caméra (ProcessPoolExecutor) pour les deux passes lourdes
+  (SVO -> MP4 brut, puis MP4 brut -> MP4 réparé avec frames noires).
+- Logging structuré (module `logging`) avec niveaux et sortie fichier optionnelle,
+  à la place des prints + emojis.
+
+Flux :
+  SVO  --(pass 1 parallèle)-->  MP4 brut + timestamps
+                                      |
+                                      v
+                             CSV global + graphes + détection FPS
+                                      |
+                                      v
+  MP4 brut --(pass 2 parallèle)--> MP4 réparé (frames noires pour drops)
+                                      |
+                                      v
+                            Sélection GUI + découpage synchro
+"""
+import os
+import sys
+import glob
+import logging
+import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+log = logging.getLogger("pipeline_sync")
+
+
+# =============================================================================
+# Logging
+# =============================================================================
+def setup_logging(level=logging.INFO, log_file=None):
+    """Configure le logger racine : console + fichier optionnel."""
+    fmt = "%(asctime)s | %(levelname)-5s | %(name)s | %(message)s"
+    datefmt = "%H:%M:%S"
+
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, mode="a", encoding="utf-8"))
+
+    logging.basicConfig(
+        level=level, format=fmt, datefmt=datefmt, handlers=handlers, force=True
+    )
+
+
+# =============================================================================
+# ÉTAPE 1+3 fusionnées : SVO -> (timestamps, MP4 brut), parallélisée
+# =============================================================================
+def _extract_and_convert_worker(
+    svo_path, output_mp4_path, start_frame=None, end_frame=None,
+    crop_left_half=True, debug=False,
+):
+    """Worker exécuté dans un process séparé.
+
+    Ouvre le SVO une seule fois, extrait les images (VIEW.LEFT), les écrit dans
+    un MP4 et collecte les timestamps.
+
+    Retour : (cam_name, timestamps_list, error_or_None)
+    """
+    # Imports locaux : le worker tourne dans un process distinct, et certains
+    # imports (pyzed) peuvent avoir besoin d'un contexte frais à chaque spawn.
+    import pyzed.sl as sl
+
+    cam_name = os.path.basename(svo_path)
+
+    init = sl.InitParameters()
+    init.set_from_svo_file(svo_path)
+    init.svo_real_time_mode = False
+
+    zed = sl.Camera()
+    if zed.open(init) != sl.ERROR_CODE.SUCCESS:
+        return (cam_name, [], f"Ouverture SVO impossible : {svo_path}")
+
+    img = sl.Mat()
+    writer = None
+    timestamps = []
+    frame_idx = 0
+    need_half_crop = False
+
+    try:
+        while True:
+            # Stop-early si end_frame demandé
+            if end_frame is not None and frame_idx > end_frame:
+                break
+
+            if zed.grab() != sl.ERROR_CODE.SUCCESS:
+                break
+
+            if start_frame is not None and frame_idx < start_frame:
+                frame_idx += 1
+                continue
+
+            zed.retrieve_image(img, sl.VIEW.LEFT)
+            arr = img.get_data()
+            if arr is None:
+                frame_idx += 1
+                continue
+
+            # BGRA -> BGR si besoin
+            frame = arr[:, :, :3] if (arr.ndim == 3 and arr.shape[2] == 4) else arr
+
+            # Détection side-by-side au 1er frame (avant init du writer)
+            if writer is None:
+                src_h, src_w = frame.shape[:2]
+                aspect = (src_w / src_h) if src_h else 0.0
+                need_half_crop = crop_left_half and (aspect > 1.7) and (src_w > 2000)
+
+            if need_half_crop:
+                frame = frame[:, : frame.shape[1] // 2]
+
+            # Init writer sur la première frame valide
+            if writer is None:
+                out_h, out_w = frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                # FPS "placeholder" dans le header : la réparation (étape 4)
+                # réécrira le MP4 au FPS cible en utilisant les timestamps.
+                writer = cv2.VideoWriter(output_mp4_path, fourcc, 30.0, (out_w, out_h))
+                if not writer.isOpened():
+                    return (cam_name, [], f"VideoWriter ne s'ouvre pas : {output_mp4_path}")
+
+            writer.write(frame)
+            timestamps.append(
+                zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_milliseconds()
+            )
+            frame_idx += 1
+
+    except Exception as e:
+        return (cam_name, timestamps, f"Exception : {e}")
+    finally:
+        if writer is not None:
+            writer.release()
+        zed.close()
+
+    return (cam_name, timestamps, None)
+
+
+def step_extract_and_convert_parallel(
+    svo_files, output_mp4_dir, start_frame=None, end_frame=None,
+    n_workers=None, debug=False,
+):
+    """Lance les workers SVO -> MP4 en parallèle. Retourne dict cam_name -> timestamps."""
+    os.makedirs(output_mp4_dir, exist_ok=True)
+
+    if n_workers is None:
+        n_workers = min(len(svo_files), os.cpu_count() or 1)
+    n_workers = max(1, n_workers)
+
+    log.info(
+        "Extraction+conversion : %d workers sur %d SVO -> %s",
+        n_workers, len(svo_files), output_mp4_dir,
+    )
+
+    tasks = []
+    for svo_path in svo_files:
+        base = os.path.splitext(os.path.basename(svo_path))[0]
+        mp4_out = os.path.join(output_mp4_dir, f"{base}.mp4")
+        tasks.append((svo_path, mp4_out))
+
+    all_timestamps = {}
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        futures = {
+            ex.submit(
+                _extract_and_convert_worker,
+                svo, mp4, start_frame, end_frame, True, debug,
+            ): (svo, mp4)
+            for svo, mp4 in tasks
+        }
+        for fut in as_completed(futures):
+            svo, mp4 = futures[fut]
+            try:
+                cam_name, timestamps, err = fut.result()
+            except Exception as e:
+                log.error("Worker crash sur %s : %s", svo, e)
+                continue
+            if err:
+                log.error("[%s] %s", cam_name, err)
+                continue
+            if not timestamps:
+                log.warning("[%s] aucune frame extraite", cam_name)
+                continue
+            all_timestamps[cam_name] = timestamps
+            log.info("[%s] %d frames -> %s", cam_name, len(timestamps), mp4)
+
+    return all_timestamps
+
+
+def step_write_csv_and_graphs(all_timestamps, csv_path, graph_path):
+    """Sauvegarde le CSV global + les deux graphes de diagnostic."""
+    log.info("CSV global -> %s", csv_path)
+    df = pd.DataFrame({k: pd.Series(v) for k, v in all_timestamps.items()})
+    df.index.name = "Frame_Index"
+    df.to_csv(csv_path)
+
+    log.info("Graphiques -> %s", graph_path)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+
+    # Delta-t par caméra
+    for cam_name, times in all_timestamps.items():
+        if len(times) > 1:
+            deltas = [times[i] - times[i - 1] for i in range(1, len(times))]
+            ax1.plot(range(1, len(times)), deltas, label=cam_name, alpha=0.7)
+    ax1.set_title("Écart entre images (pics = drops / saturation Jetson)")
+    ax1.set_xlabel("Frame Index")
+    ax1.set_ylabel("Delta (ms)")
+    ax1.legend(loc="upper right", fontsize="small")
+    ax1.grid(True)
+
+    # Temps absolu (dérive)
+    min_t = min(t[0] for t in all_timestamps.values() if t)
+    for cam_name, times in all_timestamps.items():
+        if times:
+            rel = [(t - min_t) / 1000.0 for t in times]
+            ax2.plot(range(len(times)), rel, label=cam_name)
+    ax2.set_title("Évolution du temps (écarts = désynchro / courbes divergentes = dérive)")
+    ax2.set_xlabel("Frame Index")
+    ax2.set_ylabel("Secondes écoulées")
+    ax2.legend(loc="upper left", fontsize="small")
+    ax2.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(graph_path)
+    plt.close()
+
+
+# =============================================================================
+# ÉTAPE 2 : analyse timestamps + détection du FPS
+# =============================================================================
+def step_detect_fps(csv_path):
+    """Calcule les métriques par caméra et retourne le FPS global détecté."""
+    df = pd.read_csv(csv_path, index_col=0)
+    all_deltas = []
+    metrics = []
+
+    for col in df.columns:
+        ts = df[col].dropna().values
+        if len(ts) < 2:
+            continue
+        d = np.diff(ts)
+        all_deltas.extend(d)
+        median_d = np.median(d)
+        metrics.append({
+            "Caméra": col,
+            "Total Frames": len(ts),
+            "Durée (sec)": round((ts[-1] - ts[0]) / 1000.0, 2),
+            "Images Perdues": int(np.sum(d > 1.5 * median_d)),
+            "Pire Gel (ms)": round(float(np.max(d)), 1),
+        })
+
+    log.info("Métriques par caméra :\n%s", pd.DataFrame(metrics).to_string(index=False))
+
+    first = df.iloc[0].dropna()
+    last = df.apply(lambda x: x.dropna().iloc[-1] if not x.dropna().empty else np.nan)
+    durations = last - first
+    log.info("Écart max au démarrage (frame 0) : %.2f ms", first.max() - first.min())
+    log.info("Dérive max accumulée : %.2f ms", durations.max() - durations.min())
+
+    global_median = float(np.median(all_deltas))
+    fps = round(1000.0 / global_median)
+    log.info("FPS détecté : %d (médiane delta = %.2f ms)", fps, global_median)
+    return float(fps)
+
+
+# =============================================================================
+# ÉTAPE 4 : réparation (insertion de frames noires), parallélisée
+# =============================================================================
+def _repair_mp4_worker(mp4_path, timestamps, fps_target, output_path):
+    """Worker : lit le MP4 brut, écrit un MP4 "réparé" en insérant des frames
+    noires là où les timestamps indiquent des drops."""
+    cam_name = os.path.basename(mp4_path)
+    delta_target = 1000.0 / fps_target
+
+    cap = cv2.VideoCapture(mp4_path)
+    if not cap.isOpened():
+        return (cam_name, 0, f"Ouverture MP4 impossible : {mp4_path}")
+
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(output_path, fourcc, fps_target, (w, h))
+    if not out.isOpened():
+        cap.release()
+        return (cam_name, 0, f"VideoWriter ne s'ouvre pas : {output_path}")
+
+    black = np.zeros((h, w, 3), dtype=np.uint8)
+    frames_added = 0
+    idx = 0
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            out.write(frame)
+
+            if idx < len(timestamps) - 1:
+                delta = timestamps[idx + 1] - timestamps[idx]
+                n_missing = int(round(delta / delta_target)) - 1
+                if n_missing > 0:
+                    for _ in range(n_missing):
+                        out.write(black)
+                        frames_added += 1
+            idx += 1
+    finally:
+        cap.release()
+        out.release()
+
+    return (cam_name, frames_added, None)
+
+
+def step_repair_parallel(csv_path, mp4_input_dir, mp4_output_dir, fps_target, n_workers=None):
+    """Lance la réparation en parallèle sur tous les MP4 bruts."""
+    os.makedirs(mp4_output_dir, exist_ok=True)
+    df = pd.read_csv(csv_path, index_col=0)
+
+    tasks = []
+    for col in df.columns:
+        base = col.replace(".svo", "")
+        mp4_in = os.path.join(mp4_input_dir, f"{base}.mp4")
+        mp4_out = os.path.join(mp4_output_dir, f"{base}_repaired.mp4")
+        if not os.path.exists(mp4_in):
+            log.warning("MP4 introuvable, ignoré : %s", mp4_in)
+            continue
+        timestamps = df[col].dropna().values.tolist()
+        tasks.append((mp4_in, timestamps, fps_target, mp4_out))
+
+    if not tasks:
+        log.warning("Aucun MP4 à réparer")
+        return
+
+    if n_workers is None:
+        n_workers = min(len(tasks), os.cpu_count() or 1)
+    n_workers = max(1, n_workers)
+
+    log.info("Réparation : %d workers sur %d MP4 -> %s", n_workers, len(tasks), mp4_output_dir)
+
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        futures = {ex.submit(_repair_mp4_worker, *t): t for t in tasks}
+        for fut in as_completed(futures):
+            t = futures[fut]
+            try:
+                cam_name, frames_added, err = fut.result()
+            except Exception as e:
+                log.error("Worker crash sur %s : %s", t[0], e)
+                continue
+            if err:
+                log.error("[%s] %s", cam_name, err)
+            else:
+                log.info("[%s] %d frames noires insérées -> %s", cam_name, frames_added, t[3])
+
+
+# =============================================================================
+# ORCHESTRATEUR
+# =============================================================================
+def main():
+    parser = argparse.ArgumentParser(
+        description="Pipeline SVO -> MP4 synchronisés (parallèle, logging)",
+    )
+    parser.add_argument("-i", "--input-dir", required=True,
+                        help="Dossier contenant les .svo")
+    parser.add_argument("-o", "--output-dir", default=None,
+                        help="Dossier de sortie (défaut = input-dir)")
+    parser.add_argument("--start-frame", type=int, default=None)
+    parser.add_argument("--end-frame", type=int, default=None)
+    parser.add_argument("--fps", type=float, default=None,
+                        help="Forcer un FPS cible (sinon détection auto)")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Nombre de workers parallèles (défaut = min(n_svo, n_cpu))")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="Force la ré-exécution de chaque étape")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--log-file", default=None,
+                        help="Fichier log (défaut = <output-dir>/pipeline.log)")
+    args = parser.parse_args()
+
+    INPUT_DIR = args.input_dir
+    OUTPUT_DIR = args.output_dir if args.output_dir else INPUT_DIR
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    log_file = args.log_file if args.log_file else os.path.join(OUTPUT_DIR, "pipeline.log")
+    setup_logging(level=logging.DEBUG if args.debug else logging.INFO, log_file=log_file)
+
+    FICHIER_CSV = os.path.join(OUTPUT_DIR, "Analyse_Timestamps_Global.csv")
+    FICHIER_GRAPHIQUE = os.path.join(OUTPUT_DIR, "Graphiques_Analyse.png")
+    DOSSIER_SORTIE_MP4 = os.path.join(OUTPUT_DIR, "MP4_repares")
+    OUT_SYNC_DIR = os.path.join(OUTPUT_DIR, "MP4_synced")
+
+    log.info("=" * 60)
+    log.info("DÉMARRAGE pipeline — input=%s output=%s", INPUT_DIR, OUTPUT_DIR)
+    log.info("=" * 60)
+
+    # -------------------------------------------------------------------------
+    # ÉTAPES 1+3 fusionnées : SVO -> MP4 brut + timestamps (parallèle)
+    # -------------------------------------------------------------------------
+    svo_files = sorted(glob.glob(os.path.join(INPUT_DIR, "*.svo")))
+    if not svo_files:
+        log.error("Aucun .svo trouvé dans %s", INPUT_DIR)
+        return 1
+
+    expected_mp4s = [
+        os.path.join(OUTPUT_DIR, os.path.splitext(os.path.basename(s))[0] + ".mp4")
+        for s in svo_files
+    ]
+    all_mp4s_exist = all(os.path.exists(p) for p in expected_mp4s)
+
+    if os.path.exists(FICHIER_CSV) and all_mp4s_exist and not args.overwrite:
+        log.info("Étape 1+3 déjà faite (CSV + MP4 bruts présents)")
+    else:
+        all_timestamps = step_extract_and_convert_parallel(
+            svo_files, OUTPUT_DIR,
+            start_frame=args.start_frame, end_frame=args.end_frame,
+            n_workers=args.workers, debug=args.debug,
+        )
+        if not all_timestamps:
+            log.error("Aucune caméra exploitable — arrêt")
+            return 1
+        step_write_csv_and_graphs(all_timestamps, FICHIER_CSV, FICHIER_GRAPHIQUE)
+
+    # -------------------------------------------------------------------------
+    # ÉTAPE 2 : FPS
+    # -------------------------------------------------------------------------
+    if args.fps is not None:
+        fps_detecte = args.fps
+        log.info("FPS forcé par utilisateur : %s", fps_detecte)
+    else:
+        fps_detecte = step_detect_fps(FICHIER_CSV)
+
+    # -------------------------------------------------------------------------
+    # ÉTAPE 4 : réparation (parallèle)
+    # -------------------------------------------------------------------------
+    repair_needed = (
+        args.overwrite
+        or not os.path.isdir(DOSSIER_SORTIE_MP4)
+        or not glob.glob(os.path.join(DOSSIER_SORTIE_MP4, "*.mp4"))
+    )
+    if not repair_needed:
+        log.info("Réparation déjà faite : %s", DOSSIER_SORTIE_MP4)
+    else:
+        step_repair_parallel(
+            FICHIER_CSV, OUTPUT_DIR, DOSSIER_SORTIE_MP4, fps_detecte,
+            n_workers=args.workers,
+        )
+
+    # -------------------------------------------------------------------------
+    # ÉTAPE 5 : sélection GUI
+    # -------------------------------------------------------------------------
+    processing_dir = DOSSIER_SORTIE_MP4
+    csv_sel = os.path.join(OUTPUT_DIR, "reference_frames.csv")
+
+    if not args.overwrite and os.path.exists(csv_sel):
+        log.info("Sélection références déjà faite : %s", csv_sel)
+    else:
+        try:
+            from select_reference_gui import select_reference_for_videos
+            log.info("Lancement GUI de sélection (Entrée pour valider chaque caméra)")
+            # Si start/end fournis, les MP4 réparés contiennent déjà le segment :
+            # on n'applique pas d'offset supplémentaire dans le GUI.
+            ok = select_reference_for_videos(processing_dir, csv_sel)
+            if not ok:
+                log.warning("Sélection des références interrompue")
+                return 1
+        except Exception as e:
+            log.error("GUI non disponible : %s", e)
+            return 1
+
+    # -------------------------------------------------------------------------
+    # ÉTAPE 6 : découpage / alignement final
+    # -------------------------------------------------------------------------
+    sync_needed = (
+        args.overwrite
+        or not os.path.isdir(OUT_SYNC_DIR)
+        or not glob.glob(os.path.join(OUT_SYNC_DIR, "*_synced.mp4"))
+    )
+    if not sync_needed:
+        log.info("Découpage final déjà fait : %s", OUT_SYNC_DIR)
+    else:
+        try:
+            from cut_sync import cut_videos_to_align
+            cut_videos_to_align(processing_dir, csv_sel, OUT_SYNC_DIR, fps=fps_detecte)
+        except Exception as e:
+            log.error("Découpage non exécuté : %s", e)
+            return 1
+
+    log.info("=" * 60)
+    log.info("PIPELINE TERMINÉ")
+    log.info("=" * 60)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

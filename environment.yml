@@ -1,0 +1,25 @@
+# Environnement conda reproductible pour le pipeline ZED.
+#
+# Usage :
+#   conda env create -f environment.yml
+#   conda activate zed_env
+#
+# Mise à jour après modification :
+#   conda env update -f environment.yml --prune
+#
+# ATTENTION : le binding Python du ZED SDK (`pyzed`) n'est PAS installé ici.
+# Installer séparément depuis le SDK Stereolabs — voir README.md.
+
+name: zed_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - ffmpeg
+  - numpy
+  - pandas
+  - matplotlib
+  - pip:
+    - opencv-python
