@@ -26,8 +26,14 @@ import os
 import csv
 import subprocess
 import logging
+import threading
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import cv2
+from tqdm.contrib.logging import logging_redirect_tqdm
+
+import _progress
 
 
 log = logging.getLogger(__name__)
@@ -146,9 +152,66 @@ def _cut_opencv(inp, out, start_frame_idx, common_length, fps):
 
 
 # =============================================================================
+# Worker de découpage (ffmpeg + fallback OpenCV)
+# =============================================================================
+def _cut_worker(inp, out, start_frame_idx, common_length, fps):
+    """Découpe une vidéo avec ffmpeg en parsant sa sortie -progress pour
+    remonter l'avancement frame par frame via `_progress`. Fallback OpenCV si
+    ffmpeg échoue."""
+    cam_name = os.path.basename(inp)
+    total = int(common_length) if common_length else None
+    _progress.send("total", cam_name, total)
+
+    start_sec = start_frame_idx / fps
+    cmd = ["ffmpeg", "-y", "-i", inp, "-ss", f"{start_sec:.6f}"]
+    if common_length is not None:
+        duration_sec = common_length / fps
+        cmd += ["-t", f"{duration_sec:.6f}"]
+    cmd += [
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-an",
+        "-progress", "pipe:1", "-nostats",
+        out,
+    ]
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1,
+    )
+
+    last_reported = 0
+    try:
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                line = line.strip()
+                if line.startswith("frame="):
+                    try:
+                        current = int(line.split("=", 1)[1])
+                    except ValueError:
+                        continue
+                    if current > last_reported:
+                        _progress.send("inc", cam_name, current - last_reported)
+                        last_reported = current
+        proc.wait()
+    finally:
+        stderr = proc.stderr.read() if proc.stderr else ""
+        rc = proc.returncode
+
+    ok = (rc == 0) and os.path.exists(out) and os.path.getsize(out) > 0
+    fallback_used = False
+    if not ok:
+        fallback_used = True
+        ok = _cut_opencv(inp, out, start_frame_idx, common_length, fps)
+
+    _progress.send("done", cam_name)
+    return (cam_name, ok, fallback_used, (stderr or "")[:500] if not ok else "")
+
+
+# =============================================================================
 # API principale
 # =============================================================================
-def cut_videos_to_align(dossier_videos, csv_selected, output_dir, fps=30):
+def cut_videos_to_align(dossier_videos, csv_selected, output_dir, fps=30,
+                        n_workers=None):
     os.makedirs(output_dir, exist_ok=True)
     selected = read_selected_frames(csv_selected)
     videos = sorted(selected.keys())
@@ -175,47 +238,60 @@ def cut_videos_to_align(dossier_videos, csv_selected, output_dir, fps=30):
         v: (frame_counts[v] - start_trim[v]) if frame_counts[v] is not None else None
         for v in videos
     }
-    known = [l for l in eff_lengths.values() if l is not None]
+    known = [length for length in eff_lengths.values() if length is not None]
     common_length = min(known) if known else None
 
     log.info("start_trim=%s  common_length=%s", start_trim, common_length)
 
-    # Découpage frame-accurate
+    # Un ffmpeg libx264 est déjà multi-threadé ; tourner trop de processus en
+    # parallèle sursouscrit les cœurs. On cap à cpu_count // 2 par défaut.
+    if n_workers is None:
+        n_workers = min(len(videos), max(1, (os.cpu_count() or 2) // 2))
+    n_workers = max(1, n_workers)
+
+    log.info("Découpage : %d workers sur %d vidéos -> %s", n_workers, len(videos), output_dir)
+
+    tasks = []
     for v in videos:
         inp = os.path.join(dossier_videos, v)
         out = os.path.join(output_dir, v.replace(".mp4", "_synced.mp4"))
-        start_frame_idx = int(start_trim[v])
+        tasks.append((inp, out, int(start_trim[v]), common_length, fps))
 
-        # CRITIQUE : `-ss` APRÈS `-i` + ré-encodage pour garantir la frame exacte.
-        # Avec `-c copy`, ffmpeg seek au keyframe le plus proche => erreur possible
-        # allant jusqu'à la durée du GOP (parfois >1s).
-        start_sec = start_frame_idx / fps
+    mgr = mp.Manager()
+    progress_q = mgr.Queue()
+    stop_event = threading.Event()
+    drain_thread = threading.Thread(
+        target=_progress.drain,
+        args=(progress_q, len(tasks), stop_event, "Découpage"),
+        daemon=True,
+    )
+    drain_thread.start()
 
-        cmd = ["ffmpeg", "-y", "-i", inp, "-ss", f"{start_sec:.6f}"]
-        if common_length is not None:
-            duration_sec = common_length / fps
-            cmd += ["-t", f"{duration_sec:.6f}"]
-        cmd += [
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-pix_fmt", "yuv420p", "-an", out,
-        ]
-
-        log.info("Découpage %s : start_frame=%d, length=%s", v, start_frame_idx, common_length)
-        log.debug("Commande : %s", " ".join(cmd))
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-
-        if proc.returncode != 0:
-            log.error("ffmpeg a échoué (rc=%d) sur %s : %s",
-                      proc.returncode, inp, (proc.stderr or "")[:500])
-            log.info("Tentative de fallback OpenCV pour %s", inp)
-            if not _cut_opencv(inp, out, start_frame_idx, common_length, fps):
-                log.error("Échec complet pour %s", inp)
-            continue
-
-        # Vérif post-ffmpeg : sortie non vide ?
-        if not os.path.exists(out) or os.path.getsize(out) == 0:
-            log.warning("Sortie vide pour %s, tentative OpenCV", out)
-            _cut_opencv(inp, out, start_frame_idx, common_length, fps)
+    try:
+        with logging_redirect_tqdm():
+            with ProcessPoolExecutor(
+                max_workers=n_workers,
+                initializer=_progress.init_worker,
+                initargs=(progress_q,),
+            ) as ex:
+                futures = {ex.submit(_cut_worker, *t): t for t in tasks}
+                for fut in as_completed(futures):
+                    t = futures[fut]
+                    try:
+                        cam_name, ok, fallback_used, err_msg = fut.result()
+                    except Exception as e:
+                        log.error("Worker crash sur %s : %s", t[0], e)
+                        continue
+                    if not ok:
+                        log.error("Échec complet pour %s : %s", cam_name, err_msg)
+                    elif fallback_used:
+                        log.warning("[%s] fallback OpenCV utilisé", cam_name)
+                    else:
+                        log.info("[%s] découpé -> %s", cam_name, t[1])
+    finally:
+        stop_event.set()
+        drain_thread.join(timeout=5)
+        mgr.shutdown()
 
     log.info("Découpage et synchronisation terminés : %s", output_dir)
     return True

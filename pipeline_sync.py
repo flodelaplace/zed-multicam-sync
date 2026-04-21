@@ -30,91 +30,18 @@ import logging
 import argparse
 import threading
 import multiprocessing as mp
-from queue import Empty
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import cv2
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from tqdm.auto import tqdm
 from tqdm.contrib.logging import logging_redirect_tqdm
+
+import _progress
 
 
 log = logging.getLogger("pipeline_sync")
-
-
-# =============================================================================
-# Suivi de progression partagé entre workers (ProcessPoolExecutor)
-# =============================================================================
-# Queue initialisée côté worker par `_init_worker_progress` (passé en
-# `initializer` du ProcessPoolExecutor). Les workers y publient :
-#   ("total", cam_name, N)  : nombre total de frames attendues
-#   ("inc",   cam_name, k)  : +k frames traitées depuis le dernier envoi
-#   ("done",  cam_name, _)  : worker terminé
-_PROGRESS_Q = None
-_PROGRESS_REPORT_EVERY = 20  # frames entre deux reports pour limiter l'IPC
-
-
-def _init_worker_progress(q):
-    global _PROGRESS_Q
-    _PROGRESS_Q = q
-
-
-def _progress_send(kind, cam_name, value=None):
-    q = _PROGRESS_Q
-    if q is None:
-        return
-    try:
-        q.put_nowait((kind, cam_name, value))
-    except Exception:
-        pass
-
-
-def _drain_progress(progress_q, n_workers_target, stop_event, step_label):
-    """Consomme la queue de progression et affiche une barre tqdm par caméra."""
-    bars = {}
-    positions_used = 0
-    done_count = 0
-
-    while True:
-        try:
-            msg = progress_q.get(timeout=0.25)
-        except Empty:
-            if stop_event.is_set() and done_count >= n_workers_target:
-                break
-            continue
-        if msg is None:
-            break
-
-        kind, cam, value = msg
-        if kind == "total":
-            if cam not in bars:
-                pos = positions_used
-                positions_used += 1
-                bars[cam] = tqdm(
-                    total=value if value else None,
-                    desc=f"{step_label} {cam}",
-                    position=pos,
-                    leave=True,
-                    unit="frame",
-                    dynamic_ncols=True,
-                )
-        elif kind == "inc":
-            bar = bars.get(cam)
-            if bar is not None and value:
-                bar.update(value)
-        elif kind == "done":
-            bar = bars.get(cam)
-            if bar is not None:
-                bar.close()
-            done_count += 1
-            if done_count >= n_workers_target:
-                break
-
-    for bar in bars.values():
-        if not getattr(bar, "disable", False):
-            bar.close()
 
 
 # =============================================================================
@@ -172,7 +99,7 @@ def _extract_and_convert_worker(
         total_svo_frames = 0
     if end_frame is not None and total_svo_frames:
         total_svo_frames = min(total_svo_frames, end_frame + 1)
-    _progress_send("total", cam_name, total_svo_frames)
+    _progress.send("total", cam_name, total_svo_frames)
 
     img = sl.Mat()
     writer = None
@@ -228,16 +155,16 @@ def _extract_and_convert_worker(
             )
             frame_idx += 1
 
-            if frame_idx - last_reported >= _PROGRESS_REPORT_EVERY:
-                _progress_send("inc", cam_name, frame_idx - last_reported)
+            if frame_idx - last_reported >= _progress.REPORT_EVERY:
+                _progress.send("inc", cam_name, frame_idx - last_reported)
                 last_reported = frame_idx
 
     except Exception as e:
         return (cam_name, timestamps, f"Exception : {e}")
     finally:
         if frame_idx > last_reported:
-            _progress_send("inc", cam_name, frame_idx - last_reported)
-        _progress_send("done", cam_name)
+            _progress.send("inc", cam_name, frame_idx - last_reported)
+        _progress.send("done", cam_name)
         if writer is not None:
             writer.release()
         zed.close()
@@ -272,7 +199,7 @@ def step_extract_and_convert_parallel(
     progress_q = mgr.Queue()
     stop_event = threading.Event()
     drain_thread = threading.Thread(
-        target=_drain_progress,
+        target=_progress.drain,
         args=(progress_q, len(tasks), stop_event, "Extraction"),
         daemon=True,
     )
@@ -282,7 +209,7 @@ def step_extract_and_convert_parallel(
         with logging_redirect_tqdm():
             with ProcessPoolExecutor(
                 max_workers=n_workers,
-                initializer=_init_worker_progress,
+                initializer=_progress.init_worker,
                 initargs=(progress_q,),
             ) as ex:
                 futures = {
@@ -520,7 +447,7 @@ def _repair_mp4_worker(mp4_path, timestamps, fps_target, output_path, rotate_ang
     idx = 0
     last_reported = 0
 
-    _progress_send("total", cam_name, len(timestamps))
+    _progress.send("total", cam_name, len(timestamps))
 
     try:
         while True:
@@ -537,13 +464,13 @@ def _repair_mp4_worker(mp4_path, timestamps, fps_target, output_path, rotate_ang
                     frames_added += 1
             idx += 1
 
-            if idx - last_reported >= _PROGRESS_REPORT_EVERY:
-                _progress_send("inc", cam_name, idx - last_reported)
+            if idx - last_reported >= _progress.REPORT_EVERY:
+                _progress.send("inc", cam_name, idx - last_reported)
                 last_reported = idx
     finally:
         if idx > last_reported:
-            _progress_send("inc", cam_name, idx - last_reported)
-        _progress_send("done", cam_name)
+            _progress.send("inc", cam_name, idx - last_reported)
+        _progress.send("done", cam_name)
         cap.release()
         out.release()
 
@@ -585,7 +512,7 @@ def step_repair_parallel(csv_path, mp4_input_dir, mp4_output_dir, fps_target,
     progress_q = mgr.Queue()
     stop_event = threading.Event()
     drain_thread = threading.Thread(
-        target=_drain_progress,
+        target=_progress.drain,
         args=(progress_q, len(tasks), stop_event, "Réparation"),
         daemon=True,
     )
@@ -595,7 +522,7 @@ def step_repair_parallel(csv_path, mp4_input_dir, mp4_output_dir, fps_target,
         with logging_redirect_tqdm():
             with ProcessPoolExecutor(
                 max_workers=n_workers,
-                initializer=_init_worker_progress,
+                initializer=_progress.init_worker,
                 initargs=(progress_q,),
             ) as ex:
                 futures = {ex.submit(_repair_mp4_worker, *t): t for t in tasks}
@@ -870,7 +797,10 @@ def main():
     else:
         try:
             from cut_sync import cut_videos_to_align
-            cut_videos_to_align(processing_dir, csv_sel, OUT_SYNC_DIR, fps=fps_detecte)
+            cut_videos_to_align(
+                processing_dir, csv_sel, OUT_SYNC_DIR,
+                fps=fps_detecte, n_workers=args.workers,
+            )
         except Exception as e:
             log.error("Découpage non exécuté : %s", e)
             return 1
