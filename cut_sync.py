@@ -179,6 +179,24 @@ def _cut_worker(inp, out, start_frame_idx, common_length, fps):
         text=True, bufsize=1,
     )
 
+    # CRITIQUE : draine stderr dans un thread, sinon le buffer OS (~64 KB sous
+    # Windows) finit par se remplir (ffmpeg écrit les infos de stream + summary
+    # final sur stderr) et ffmpeg bloque sur write -> deadlock avec tous les
+    # workers à 100 % mais jamais "done".
+    stderr_chunks = []
+
+    def _drain_stderr(pipe):
+        try:
+            for line in pipe:
+                stderr_chunks.append(line)
+        except Exception:
+            pass
+
+    stderr_thread = threading.Thread(
+        target=_drain_stderr, args=(proc.stderr,), daemon=True,
+    )
+    stderr_thread.start()
+
     last_reported = 0
     try:
         if proc.stdout is not None:
@@ -194,7 +212,8 @@ def _cut_worker(inp, out, start_frame_idx, common_length, fps):
                         last_reported = current
         proc.wait()
     finally:
-        stderr = proc.stderr.read() if proc.stderr else ""
+        stderr_thread.join(timeout=2)
+        stderr = "".join(stderr_chunks)
         rc = proc.returncode
 
     ok = (rc == 0) and os.path.exists(out) and os.path.getsize(out) > 0
