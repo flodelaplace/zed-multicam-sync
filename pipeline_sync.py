@@ -25,6 +25,7 @@ Flux :
 import os
 import sys
 import glob
+import json
 import logging
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -344,11 +345,38 @@ def _apply_rotation(frame, angle):
     return frame
 
 
+def _compute_n_missing_per_gap(timestamps, fps_target):
+    """Pour chaque gap ts[i] -> ts[i+1], nombre de frames noires à insérer.
+
+    Logique strictement identique à `_repair_mp4_worker` ; partagée pour que les
+    sidecars de drops décrivent exactement les frames effectivement insérées."""
+    delta_target = 1000.0 / fps_target
+    out = []
+    for i in range(len(timestamps) - 1):
+        n = int(round((timestamps[i + 1] - timestamps[i]) / delta_target)) - 1
+        out.append(max(0, n))
+    return out
+
+
+def compute_repaired_dropped_indices(timestamps, fps_target):
+    """Indices 0-based des frames noires dans le MP4 réparé."""
+    n_missing_list = _compute_n_missing_per_gap(timestamps, fps_target)
+    dropped = []
+    pos = 0
+    for i in range(len(timestamps)):
+        pos += 1  # raw frame i écrite à l'index (pos - 1)
+        if i < len(n_missing_list):
+            for _ in range(n_missing_list[i]):
+                dropped.append(pos)
+                pos += 1
+    return dropped
+
+
 def _repair_mp4_worker(mp4_path, timestamps, fps_target, output_path, rotate_angle=0):
     """Worker : lit le MP4 brut, applique la rotation éventuelle, écrit un MP4
     "réparé" en insérant des frames noires là où les timestamps indiquent des drops."""
     cam_name = os.path.basename(mp4_path)
-    delta_target = 1000.0 / fps_target
+    n_missing_list = _compute_n_missing_per_gap(timestamps, fps_target)
 
     cap = cv2.VideoCapture(mp4_path)
     if not cap.isOpened():
@@ -382,13 +410,10 @@ def _repair_mp4_worker(mp4_path, timestamps, fps_target, output_path, rotate_ang
                 frame = _apply_rotation(frame, rotate_angle)
             out.write(frame)
 
-            if idx < len(timestamps) - 1:
-                delta = timestamps[idx + 1] - timestamps[idx]
-                n_missing = int(round(delta / delta_target)) - 1
-                if n_missing > 0:
-                    for _ in range(n_missing):
-                        out.write(black)
-                        frames_added += 1
+            if idx < len(n_missing_list):
+                for _ in range(n_missing_list[idx]):
+                    out.write(black)
+                    frames_added += 1
             idx += 1
     finally:
         cap.release()
@@ -444,6 +469,114 @@ def step_repair_parallel(csv_path, mp4_input_dir, mp4_output_dir, fps_target,
 
 
 # =============================================================================
+# ÉTAPE 7 : sidecars JSON listant les frames noires du MP4 synced final
+# =============================================================================
+def step_write_dropped_sidecars(csv_timestamps, csv_selected, mp4_repaired_dir,
+                                mp4_synced_dir, fps_target, overwrite=False):
+    """Écrit un sidecar `<stem>.dropped.json` à côté de chaque MP4 synced.
+
+    Le sidecar liste les indices 0-based des frames noires dans le MP4 synced
+    final, calculés de façon déterministe à partir des timestamps SVO et de la
+    sélection GUI — pas de détection pixel."""
+    from cut_sync import _fast_frame_count, read_selected_frames
+
+    if not os.path.isfile(csv_timestamps):
+        log.error("Sidecars : CSV timestamps introuvable : %s", csv_timestamps)
+        return
+    if not os.path.isfile(csv_selected):
+        log.error("Sidecars : CSV sélection introuvable : %s", csv_selected)
+        return
+
+    df = pd.read_csv(csv_timestamps, index_col=0)
+    selected = read_selected_frames(csv_selected)
+    if not selected:
+        log.warning("Sidecars : aucune vidéo sélectionnée")
+        return
+
+    # Référence = sélection la plus précoce (identique à cut_sync) -> start_trim >= 0
+    ref_frame = min(selected.values())
+
+    per_cam = {}
+    for col in df.columns:
+        base = col.replace(".svo", "")
+        repaired_name = f"{base}_repaired.mp4"
+        if repaired_name not in selected:
+            log.warning("[%s] absent de reference_frames.csv, ignoré", base)
+            continue
+        repaired_path = os.path.join(mp4_repaired_dir, repaired_name)
+        if not os.path.exists(repaired_path):
+            log.warning("[%s] MP4 réparé introuvable : %s", base, repaired_path)
+            continue
+        per_cam[base] = {
+            "timestamps": df[col].dropna().values.tolist(),
+            "repaired_name": repaired_name,
+            "repaired_path": repaired_path,
+            "selected": selected[repaired_name],
+        }
+
+    if not per_cam:
+        log.warning("Sidecars : aucune caméra exploitable")
+        return
+
+    # start_trim et common_length : strictement la même logique que cut_sync.
+    start_trim = {cam: d["selected"] - ref_frame for cam, d in per_cam.items()}
+    frame_counts = {
+        cam: _fast_frame_count(d["repaired_path"], fps_target)
+        for cam, d in per_cam.items()
+    }
+    eff = [frame_counts[cam] - start_trim[cam]
+           for cam in per_cam if frame_counts[cam] is not None]
+    if not eff:
+        log.error("Sidecars : impossible de calculer common_length (frame counts manquants)")
+        return
+    common_length = min(eff)
+
+    log.info("Sidecars : start_trim=%s common_length=%d", start_trim, common_length)
+
+    sidecar_paths = {
+        cam: os.path.join(mp4_synced_dir, f"{cam}_repaired_synced.dropped.json")
+        for cam in per_cam
+    }
+    if not overwrite and all(os.path.exists(p) for p in sidecar_paths.values()):
+        log.info("Sidecars déjà présents (utiliser --overwrite ou --rerun-sidecars pour régénérer)")
+        return
+
+    os.makedirs(mp4_synced_dir, exist_ok=True)
+
+    for cam, d in per_cam.items():
+        repaired_dropped = compute_repaired_dropped_indices(d["timestamps"], fps_target)
+        st = start_trim[cam]
+        upper = st + common_length
+        synced_dropped = sorted(
+            r - st for r in repaired_dropped if st <= r < upper
+        )
+
+        synced_mp4 = os.path.join(mp4_synced_dir, f"{cam}_repaired_synced.mp4")
+        actual = (
+            _fast_frame_count(synced_mp4, fps_target)
+            if os.path.exists(synced_mp4) else None
+        )
+        if actual is not None and abs(actual - common_length) > 1:
+            log.warning(
+                "[%s] total_frames divergent : calculé=%d, MP4 réel=%d",
+                cam, common_length, actual,
+            )
+
+        payload = {
+            "fps": int(round(fps_target)),
+            "total_frames": common_length,
+            "dropped_frame_indices": synced_dropped,
+        }
+        sidecar_path = sidecar_paths[cam]
+        with open(sidecar_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        log.info(
+            "[%s] %d frames noires listées (sur %d réparées) -> %s",
+            cam, len(synced_dropped), len(repaired_dropped), sidecar_path,
+        )
+
+
+# =============================================================================
 # ORCHESTRATEUR
 # =============================================================================
 def main():
@@ -472,6 +605,9 @@ def main():
                         help="Refait uniquement les étapes 4 (réparation) et 6 "
                              "(découpage) sans re-lire les SVO. Pratique pour "
                              "tester de nouvelles rotations.")
+    parser.add_argument("--rerun-sidecars", action="store_true",
+                        help="Force la régénération des sidecars *.dropped.json "
+                             "sans toucher aux MP4.")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--log-file", default=None,
                         help="Fichier log (défaut = <output-dir>/pipeline.log)")
@@ -590,6 +726,19 @@ def main():
         except Exception as e:
             log.error("Découpage non exécuté : %s", e)
             return 1
+
+    # -------------------------------------------------------------------------
+    # ÉTAPE 7 : sidecars JSON des frames noires (déterministe, pour calibrator)
+    # -------------------------------------------------------------------------
+    sidecars_force = args.overwrite or args.rerun_repair or args.rerun_sidecars
+    try:
+        step_write_dropped_sidecars(
+            FICHIER_CSV, csv_sel, DOSSIER_SORTIE_MP4, OUT_SYNC_DIR,
+            fps_detecte, overwrite=sidecars_force,
+        )
+    except Exception as e:
+        log.error("Sidecars non générés : %s", e)
+        return 1
 
     log.info("=" * 60)
     log.info("PIPELINE TERMINÉ")

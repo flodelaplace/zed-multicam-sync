@@ -24,6 +24,7 @@ def select_reference_for_videos(dossier_videos, output_csv, initial_video=None, 
             video_files = video_files[idx:] + video_files[:idx]
 
     results = []
+    last_selected = None
 
     for vid in video_files:
         cap = cv2.VideoCapture(vid)
@@ -39,7 +40,10 @@ def select_reference_for_videos(dossier_videos, output_csv, initial_video=None, 
             end_idx = total_frames - 1
         total = end_idx - start_idx + 1 if end_idx >= start_idx else 0
         print(f"Ouverture {vid} ({total} frames)")
-        idx = start_idx
+        if last_selected is not None:
+            idx = min(max(last_selected, start_idx), end_idx)
+        else:
+            idx = start_idx
         selected = None
         window_name = f"Select reference - {os.path.basename(vid)}"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
@@ -74,6 +78,7 @@ def select_reference_for_videos(dossier_videos, output_csv, initial_video=None, 
                     selected = idx
                 # Save result for this video
                 results.append((os.path.basename(vid), selected))
+                last_selected = selected
                 break
             elif key == ord('z'):  # jump -10
                 idx = max(idx - 10, 0)
