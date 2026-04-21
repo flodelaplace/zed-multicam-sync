@@ -79,6 +79,9 @@ def _extract_and_convert_worker(
     init = sl.InitParameters()
     init.set_from_svo_file(svo_path)
     init.svo_real_time_mode = False
+    # On ne retrieve que VIEW.LEFT : pas besoin du calcul depth (NEURAL par
+    # défaut charge un réseau de neurones qui sature la GPU pour rien).
+    init.depth_mode = sl.DEPTH_MODE.NONE
 
     zed = sl.Camera()
     if zed.open(init) != sl.ERROR_CODE.SUCCESS:
