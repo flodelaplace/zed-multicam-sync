@@ -10,6 +10,44 @@ import cv2
 import argparse
 
 
+HELP_LINES = [
+    "A / <-  : -1 frame",
+    "D / ->  : +1 frame",
+    "Z       : -10 frames",
+    "X       : +10 frames",
+    "W / SPC : marquer frame",
+    "S / ENT : valider + suivant",
+    "Q       : quitter",
+]
+
+
+def _draw_help_overlay(img):
+    """Dessine un panneau d'aide semi-transparent en bas à gauche."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.55
+    thickness = 1
+    line_h = 22
+    pad = 8
+
+    widths = [cv2.getTextSize(t, font, scale, thickness)[0][0] for t in HELP_LINES]
+    box_w = max(widths) + 2 * pad
+    box_h = line_h * len(HELP_LINES) + 2 * pad
+
+    h = img.shape[0]
+    x0, y0 = 10, h - box_h - 10
+    x1, y1 = x0 + box_w, y0 + box_h
+
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.55, img, 0.45, 0, img)
+    cv2.rectangle(img, (x0, y0), (x1, y1), (255, 255, 255), 1)
+
+    for i, text in enumerate(HELP_LINES):
+        y = y0 + pad + line_h * (i + 1) - 6
+        cv2.putText(img, text, (x0 + pad, y), font, scale,
+                    (255, 255, 255), thickness, cv2.LINE_AA)
+
+
 def select_reference_for_videos(dossier_videos, output_csv, initial_video=None, start_frame=None, end_frame=None):
     video_files = sorted([os.path.join(dossier_videos, f) for f in os.listdir(dossier_videos) if f.lower().endswith('.mp4')])
     if not video_files:
@@ -59,6 +97,7 @@ def select_reference_for_videos(dossier_videos, output_csv, initial_video=None, 
             cv2.putText(display, f"Frame: {idx}/{end_idx}", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
             if selected is not None:
                 cv2.putText(display, f"Selected: {selected}", (10,70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+            _draw_help_overlay(display)
             cv2.imshow(window_name, display)
             key = cv2.waitKey(0) & 0xFF
 
