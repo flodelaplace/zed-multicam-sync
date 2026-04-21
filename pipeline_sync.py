@@ -28,15 +28,93 @@ import glob
 import json
 import logging
 import argparse
+import threading
+import multiprocessing as mp
+from queue import Empty
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import cv2
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from tqdm.auto import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 
 log = logging.getLogger("pipeline_sync")
+
+
+# =============================================================================
+# Suivi de progression partagé entre workers (ProcessPoolExecutor)
+# =============================================================================
+# Queue initialisée côté worker par `_init_worker_progress` (passé en
+# `initializer` du ProcessPoolExecutor). Les workers y publient :
+#   ("total", cam_name, N)  : nombre total de frames attendues
+#   ("inc",   cam_name, k)  : +k frames traitées depuis le dernier envoi
+#   ("done",  cam_name, _)  : worker terminé
+_PROGRESS_Q = None
+_PROGRESS_REPORT_EVERY = 20  # frames entre deux reports pour limiter l'IPC
+
+
+def _init_worker_progress(q):
+    global _PROGRESS_Q
+    _PROGRESS_Q = q
+
+
+def _progress_send(kind, cam_name, value=None):
+    q = _PROGRESS_Q
+    if q is None:
+        return
+    try:
+        q.put_nowait((kind, cam_name, value))
+    except Exception:
+        pass
+
+
+def _drain_progress(progress_q, n_workers_target, stop_event, step_label):
+    """Consomme la queue de progression et affiche une barre tqdm par caméra."""
+    bars = {}
+    positions_used = 0
+    done_count = 0
+
+    while True:
+        try:
+            msg = progress_q.get(timeout=0.25)
+        except Empty:
+            if stop_event.is_set() and done_count >= n_workers_target:
+                break
+            continue
+        if msg is None:
+            break
+
+        kind, cam, value = msg
+        if kind == "total":
+            if cam not in bars:
+                pos = positions_used
+                positions_used += 1
+                bars[cam] = tqdm(
+                    total=value if value else None,
+                    desc=f"{step_label} {cam}",
+                    position=pos,
+                    leave=True,
+                    unit="frame",
+                    dynamic_ncols=True,
+                )
+        elif kind == "inc":
+            bar = bars.get(cam)
+            if bar is not None and value:
+                bar.update(value)
+        elif kind == "done":
+            bar = bars.get(cam)
+            if bar is not None:
+                bar.close()
+            done_count += 1
+            if done_count >= n_workers_target:
+                break
+
+    for bar in bars.values():
+        if not getattr(bar, "disable", False):
+            bar.close()
 
 
 # =============================================================================
@@ -87,10 +165,20 @@ def _extract_and_convert_worker(
     if zed.open(init) != sl.ERROR_CODE.SUCCESS:
         return (cam_name, [], f"Ouverture SVO impossible : {svo_path}")
 
+    # Total pour la barre de progression (peut être 0 si SDK ne sait pas)
+    try:
+        total_svo_frames = int(zed.get_svo_number_of_frames())
+    except Exception:
+        total_svo_frames = 0
+    if end_frame is not None and total_svo_frames:
+        total_svo_frames = min(total_svo_frames, end_frame + 1)
+    _progress_send("total", cam_name, total_svo_frames)
+
     img = sl.Mat()
     writer = None
     timestamps = []
     frame_idx = 0
+    last_reported = 0
     need_half_crop = False
 
     try:
@@ -140,9 +228,16 @@ def _extract_and_convert_worker(
             )
             frame_idx += 1
 
+            if frame_idx - last_reported >= _PROGRESS_REPORT_EVERY:
+                _progress_send("inc", cam_name, frame_idx - last_reported)
+                last_reported = frame_idx
+
     except Exception as e:
         return (cam_name, timestamps, f"Exception : {e}")
     finally:
+        if frame_idx > last_reported:
+            _progress_send("inc", cam_name, frame_idx - last_reported)
+        _progress_send("done", cam_name)
         if writer is not None:
             writer.release()
         zed.close()
@@ -173,29 +268,49 @@ def step_extract_and_convert_parallel(
         tasks.append((svo_path, mp4_out))
 
     all_timestamps = {}
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
-        futures = {
-            ex.submit(
-                _extract_and_convert_worker,
-                svo, mp4, start_frame, end_frame, True, debug,
-            ): (svo, mp4)
-            for svo, mp4 in tasks
-        }
-        for fut in as_completed(futures):
-            svo, mp4 = futures[fut]
-            try:
-                cam_name, timestamps, err = fut.result()
-            except Exception as e:
-                log.error("Worker crash sur %s : %s", svo, e)
-                continue
-            if err:
-                log.error("[%s] %s", cam_name, err)
-                continue
-            if not timestamps:
-                log.warning("[%s] aucune frame extraite", cam_name)
-                continue
-            all_timestamps[cam_name] = timestamps
-            log.info("[%s] %d frames -> %s", cam_name, len(timestamps), mp4)
+    mgr = mp.Manager()
+    progress_q = mgr.Queue()
+    stop_event = threading.Event()
+    drain_thread = threading.Thread(
+        target=_drain_progress,
+        args=(progress_q, len(tasks), stop_event, "Extraction"),
+        daemon=True,
+    )
+    drain_thread.start()
+
+    try:
+        with logging_redirect_tqdm():
+            with ProcessPoolExecutor(
+                max_workers=n_workers,
+                initializer=_init_worker_progress,
+                initargs=(progress_q,),
+            ) as ex:
+                futures = {
+                    ex.submit(
+                        _extract_and_convert_worker,
+                        svo, mp4, start_frame, end_frame, True, debug,
+                    ): (svo, mp4)
+                    for svo, mp4 in tasks
+                }
+                for fut in as_completed(futures):
+                    svo, mp4 = futures[fut]
+                    try:
+                        cam_name, timestamps, err = fut.result()
+                    except Exception as e:
+                        log.error("Worker crash sur %s : %s", svo, e)
+                        continue
+                    if err:
+                        log.error("[%s] %s", cam_name, err)
+                        continue
+                    if not timestamps:
+                        log.warning("[%s] aucune frame extraite", cam_name)
+                        continue
+                    all_timestamps[cam_name] = timestamps
+                    log.info("[%s] %d frames -> %s", cam_name, len(timestamps), mp4)
+    finally:
+        stop_event.set()
+        drain_thread.join(timeout=5)
+        mgr.shutdown()
 
     return all_timestamps
 
@@ -403,6 +518,9 @@ def _repair_mp4_worker(mp4_path, timestamps, fps_target, output_path, rotate_ang
     black = np.zeros((out_h, out_w, 3), dtype=np.uint8)
     frames_added = 0
     idx = 0
+    last_reported = 0
+
+    _progress_send("total", cam_name, len(timestamps))
 
     try:
         while True:
@@ -418,7 +536,14 @@ def _repair_mp4_worker(mp4_path, timestamps, fps_target, output_path, rotate_ang
                     out.write(black)
                     frames_added += 1
             idx += 1
+
+            if idx - last_reported >= _PROGRESS_REPORT_EVERY:
+                _progress_send("inc", cam_name, idx - last_reported)
+                last_reported = idx
     finally:
+        if idx > last_reported:
+            _progress_send("inc", cam_name, idx - last_reported)
+        _progress_send("done", cam_name)
         cap.release()
         out.release()
 
@@ -456,19 +581,39 @@ def step_repair_parallel(csv_path, mp4_input_dir, mp4_output_dir, fps_target,
 
     log.info("Réparation : %d workers sur %d MP4 -> %s", n_workers, len(tasks), mp4_output_dir)
 
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
-        futures = {ex.submit(_repair_mp4_worker, *t): t for t in tasks}
-        for fut in as_completed(futures):
-            t = futures[fut]
-            try:
-                cam_name, frames_added, err = fut.result()
-            except Exception as e:
-                log.error("Worker crash sur %s : %s", t[0], e)
-                continue
-            if err:
-                log.error("[%s] %s", cam_name, err)
-            else:
-                log.info("[%s] %d frames noires insérées -> %s", cam_name, frames_added, t[3])
+    mgr = mp.Manager()
+    progress_q = mgr.Queue()
+    stop_event = threading.Event()
+    drain_thread = threading.Thread(
+        target=_drain_progress,
+        args=(progress_q, len(tasks), stop_event, "Réparation"),
+        daemon=True,
+    )
+    drain_thread.start()
+
+    try:
+        with logging_redirect_tqdm():
+            with ProcessPoolExecutor(
+                max_workers=n_workers,
+                initializer=_init_worker_progress,
+                initargs=(progress_q,),
+            ) as ex:
+                futures = {ex.submit(_repair_mp4_worker, *t): t for t in tasks}
+                for fut in as_completed(futures):
+                    t = futures[fut]
+                    try:
+                        cam_name, frames_added, err = fut.result()
+                    except Exception as e:
+                        log.error("Worker crash sur %s : %s", t[0], e)
+                        continue
+                    if err:
+                        log.error("[%s] %s", cam_name, err)
+                    else:
+                        log.info("[%s] %d frames noires insérées -> %s", cam_name, frames_added, t[3])
+    finally:
+        stop_event.set()
+        drain_thread.join(timeout=5)
+        mgr.shutdown()
 
 
 # =============================================================================

@@ -21,5 +21,6 @@ dependencies:
   - numpy
   - pandas
   - matplotlib
+  - tqdm
   - pip:
     - opencv-python
