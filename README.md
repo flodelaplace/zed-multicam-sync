@@ -124,6 +124,7 @@ python pipeline_sync.py -i "chemin/vers/mon_enregistrement"
 | `--rotate SPEC` | rotation par caméra (voir section ci-dessous) |
 | `--overwrite` | force la ré-exécution de toutes les étapes |
 | `--rerun-repair` | refait seulement les étapes 4 + 6 (ré-utilisation avec nouvelle rotation) |
+| `--rerun-sidecars` | régénère uniquement les sidecars `*.dropped.json` sans retoucher aux MP4 |
 | `--log-file PATH` | fichier log (défaut : `<output>/pipeline.log`) |
 | `--debug` | logs DEBUG |
 
@@ -199,6 +200,10 @@ reference_frames.csv
     │  Étape 6 : découpage frame-accurate pour aligner les vidéos
     ▼
 MP4_synced/   (toutes vidéos alignées, même longueur)
+    │
+    │  Étape 7 : écriture des sidecars *.dropped.json (indices des frames noires)
+    ▼
+MP4_synced/<cam>_repaired_synced.dropped.json
 ```
 
 ### Pourquoi deux passes ?
@@ -224,13 +229,40 @@ Dans `<output-dir>` (= `<input-dir>` par défaut) :
 ├── reference_frames.csv            # frame de référence choisie dans la GUI
 ├── pipeline.log                    # log complet de l'exécution
 ├── MP4_repares/
-│   └── <cam>_repaired.mp4          # MP4 avec frames noires insérées
+│   └── <cam>_repaired.mp4                        # MP4 avec frames noires insérées
 └── MP4_synced/
-    └── <cam>_synced.mp4            # MP4 finaux alignés
+    ├── <cam>_repaired_synced.mp4                 # MP4 finaux alignés
+    └── <cam>_repaired_synced.dropped.json        # sidecar : indices des frames noires
 ```
 
 **Ce qu'il faut utiliser** : les fichiers dans `MP4_synced/`. Les autres sont
 des étapes intermédiaires / outils de diagnostic.
+
+### Sidecars `*.dropped.json`
+
+À côté de chaque MP4 synced, un sidecar JSON liste les **indices 0-based des
+frames noires** insérées pour compenser les drops SVO. Format :
+
+```json
+{
+  "fps": 30,
+  "total_frames": 1800,
+  "dropped_frame_indices": [42, 87, 512]
+}
+```
+
+Les consommateurs aval (calibration multi-cam, export Pose2Sim, tracking…)
+peuvent ainsi **ignorer ces frames sans refaire de détection pixel**. Les
+indices sont calculés de façon déterministe depuis les timestamps SVO et la
+sélection GUI — ils décrivent exactement les frames insérées à l'étape 4,
+retransposées dans l'espace du MP4 synced final (après découpage).
+
+Pour régénérer les sidecars sur un run déjà calculé, sans rejouer tout le
+pipeline :
+
+```bash
+python tools/build_dropped_sidecars.py --input-dir <output-dir>
+```
 
 ---
 
@@ -281,6 +313,7 @@ Scripts autonomes non requis par le pipeline principal, mais utiles en dépannag
 | `tools/svo_converter.py` | Conversion SVO → MP4 avec choix de vue (`left`/`right`/`depth`/`side_by_side`) |
 | `tools/utils_rotate_ffmpeg.py` | Rotation batch de vidéos (90°/270°) via ffmpeg |
 | `tools/bench_convert.py` | Benchmark ffmpeg vs ZED SDK sur un segment court |
+| `tools/build_dropped_sidecars.py` | (Re)génère les sidecars `*.dropped.json` sur un run existant, sans rejouer les étapes 1-6 |
 
 Chaque script est exécutable avec `python tools/<nom>.py --help`.
 
@@ -303,7 +336,8 @@ Codes_ZED/
     ├── convert_svo.py
     ├── svo_converter.py
     ├── utils_rotate_ffmpeg.py
-    └── bench_convert.py
+    ├── bench_convert.py
+    └── build_dropped_sidecars.py
 ```
 
 ---
@@ -315,9 +349,13 @@ Codes_ZED/
   `-c copy` qui seek au keyframe le plus proche — jusqu'à ±2s d'erreur sur
   des GOP longs.
 - **Insertion de frames noires** : choix volontaire pour matérialiser les drops.
-  Si le traitement aval (pose estimation, tracking, ML) s'en trouve perturbé,
-  remplacer par la dernière frame valide : dans `pipeline_sync.py > _repair_mp4_worker`,
-  remplacer `out.write(black)` par `out.write(frame)`.
+  Les indices des frames insérées sont exportés dans les sidecars
+  `*.dropped.json` (voir section *Sidecars*), ce qui permet au traitement aval
+  (calibration, Pose2Sim, pose estimation, tracking…) de les ignorer sans
+  refaire de détection pixel. Si malgré tout elles perturbent un pipeline
+  existant, on peut remplacer par la dernière frame valide : dans
+  `pipeline_sync.py > _repair_mp4_worker`, remplacer `out.write(black)` par
+  `out.write(frame)`.
 - **FPS détecté** : médiane globale des deltas entre timestamps, sur toutes
   caméras confondues. Si les caméras tournent à des FPS différents (cas rare
   mais possible), forcer avec `--fps N`.
