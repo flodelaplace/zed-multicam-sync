@@ -92,6 +92,14 @@ def _extract_and_convert_worker(
     if zed.open(init) != sl.ERROR_CODE.SUCCESS:
         return (cam_name, [], f"Ouverture SVO impossible : {svo_path}")
 
+    # Seek frame-accurate au start_frame demandé : le SDK ZED le fait nativement,
+    # inutile de décoder toutes les frames intermédiaires avec grab()+continue.
+    if start_frame is not None and start_frame > 0:
+        try:
+            zed.set_svo_position(int(start_frame))
+        except Exception as e:
+            return (cam_name, [], f"set_svo_position({start_frame}) impossible : {e}")
+
     # Total pour la barre de progression (peut être 0 si SDK ne sait pas)
     try:
         total_svo_frames = int(zed.get_svo_number_of_frames())
@@ -99,13 +107,15 @@ def _extract_and_convert_worker(
         total_svo_frames = 0
     if end_frame is not None and total_svo_frames:
         total_svo_frames = min(total_svo_frames, end_frame + 1)
+    if start_frame is not None and total_svo_frames:
+        total_svo_frames = max(0, total_svo_frames - start_frame)
     _progress.send("total", cam_name, total_svo_frames)
 
     img = sl.Mat()
     writer = None
     timestamps = []
-    frame_idx = 0
-    last_reported = 0
+    frame_idx = int(start_frame) if start_frame else 0
+    last_reported = frame_idx
     need_half_crop = False
 
     try:
@@ -116,10 +126,6 @@ def _extract_and_convert_worker(
 
             if zed.grab() != sl.ERROR_CODE.SUCCESS:
                 break
-
-            if start_frame is not None and frame_idx < start_frame:
-                frame_idx += 1
-                continue
 
             zed.retrieve_image(img, sl.VIEW.LEFT)
             arr = img.get_data()
